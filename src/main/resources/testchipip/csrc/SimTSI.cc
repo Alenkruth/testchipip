@@ -48,8 +48,14 @@ extern "C" int tsi_tick(
         // Prevent simv option enter htif
         remove_vcs_simv_opt(info.argc, info.argv);
 
+        // Build a filtered copy so we don't corrupt Verilator's shared argv array
+        std::vector<char*> tsi_argv;
+        for (int i = 0; i < info.argc; i++)
+            if (std::string(info.argv[i]).find("+reconfig_csrs=") != 0)
+                tsi_argv.push_back(info.argv[i]);
+
         // TODO: We should somehow inspect whether or not our backing memory supports loadmem, instead of unconditionally setting it to true
-        tsis[chip_id] = new testchip_tsi_t(info.argc, info.argv, true);
+        tsis[chip_id] = new testchip_tsi_t((int)tsi_argv.size(), tsi_argv.data(), true);
     }
 
     testchip_tsi_t* tsi = tsis[chip_id];

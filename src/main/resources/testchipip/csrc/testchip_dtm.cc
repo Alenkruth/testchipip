@@ -44,17 +44,40 @@
 
 #define MAX_VLEN (8 * 32) // Limited by debug module capacity
 
-testchip_dtm_t::testchip_dtm_t(int argc, char** argv, bool can_have_loadmem) : dtm_t(argc, argv), loadarch_done(false)
+testchip_dtm_t::testchip_dtm_t(int argc, char** argv, bool can_have_loadmem)
+  : testchip_dtm_arg_filter_t(argc, argv),
+    dtm_t(filt_argc, filt_argv.data()),
+    loadarch_done(false)
 {
   has_loadmem = false;
   is_loadmem = false;
   loadarch_file = "";
+  reconfig_csrs_file = "";
   std::vector<std::string> args(argv + 1, argv + argc);
   for (auto& arg : args) {
     if (arg.find("+loadmem=") == 0)
       has_loadmem = can_have_loadmem;
     if (arg.find("+loadarch=") == 0)
       loadarch_file = arg.substr(strlen("+loadarch="));
+    if (arg.find("+reconfig_csrs=") == 0)
+      reconfig_csrs_file = arg.substr(strlen("+reconfig_csrs="));
+  }
+  if (reconfig_csrs_file != "") {
+    std::ifstream rcf(reconfig_csrs_file);
+    if (!rcf.is_open()) {
+      printf("reconfig_csrs: could not open %s\n", reconfig_csrs_file.c_str());
+      abort();
+    }
+    std::string line;
+    while (std::getline(rcf, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      auto eq = line.find('=');
+      if (eq == std::string::npos) continue;
+      uint32_t addr = (uint32_t)std::stoull(line.substr(0, eq), nullptr, 0);
+      uint64_t val  = std::stoull(line.substr(eq + 1), nullptr, 0);
+      reconfig_csrs.push_back({addr, val});
+    }
+    printf("reconfig_csrs: loaded %zu writes from %s\n", reconfig_csrs.size(), reconfig_csrs_file.c_str());
   }
   testchip_htif_t::parse_htif_args(args);
 }
@@ -339,13 +362,25 @@ void testchip_dtm_t::reset()
     printf("loadarch resuming harts\n");
     loadarch_done = true;
     for (size_t hartsel = 0; hartsel < nharts; hartsel++) {
+      for (auto& csr : reconfig_csrs) {
+        loadarch_restore_csr(csr.first, (reg_t)csr.second);
+      }
       resume(hartsel);
     }
-  } else if (write_hart0_msip) {
-    // The dtm_t::reset skips the rest of the bootrom
-    // Use CLINT to interrupt the core instead
-    //dtm_t::reset();
-    uint32_t one = 1;
-    write_chunk(MSIP_BASE, sizeof(uint32_t), &one);
+  } else {
+    if (!reconfig_csrs.empty()) {
+      halt(0);
+      for (auto& csr : reconfig_csrs) {
+        loadarch_restore_csr(csr.first, (reg_t)csr.second);
+      }
+      resume(0);
+    }
+    if (write_hart0_msip) {
+      // The dtm_t::reset skips the rest of the bootrom
+      // Use CLINT to interrupt the core instead
+      //dtm_t::reset();
+      uint32_t one = 1;
+      write_chunk(MSIP_BASE, sizeof(uint32_t), &one);
+    }
   }
 }

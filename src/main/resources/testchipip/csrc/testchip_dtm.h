@@ -3,9 +3,23 @@
 
 #include <string>
 #include <fesvr/dtm.h>
+#include <utility>
 #include <vector>
 #include <riscv/processor.h>
 #include "testchip_htif.h"
+
+// Base class initialized before dtm_t to strip +reconfig_csrs= from argv
+// before fesvr's htif_t arg parser treats it as the target binary path.
+struct testchip_dtm_arg_filter_t {
+  std::vector<char*> filt_argv;
+  int filt_argc;
+  testchip_dtm_arg_filter_t(int argc, char** argv) : filt_argc(0) {
+    for (int i = 0; i < argc; i++)
+      if (std::string(argv[i]).find("+reconfig_csrs=") != 0)
+        filt_argv.push_back(argv[i]);
+    filt_argc = (int)filt_argv.size();
+  }
+};
 
 struct loadarch_state_t {
   reg_t pc;
@@ -50,7 +64,7 @@ struct loadarch_state_t {
   unsigned char* VPR[32];
 };
 
-class testchip_dtm_t : public dtm_t, public testchip_htif_t
+class testchip_dtm_t : private testchip_dtm_arg_filter_t, public dtm_t, public testchip_htif_t
 {
  public:
   testchip_dtm_t(int argc, char** argv, bool has_loadmem);
@@ -76,6 +90,8 @@ class testchip_dtm_t : public dtm_t, public testchip_htif_t
  private:
   bool is_loadmem;
   std::string loadarch_file;
+  std::string reconfig_csrs_file;
+  std::vector<std::pair<uint32_t, uint64_t>> reconfig_csrs;
 
   void loadarch_restore_csr(uint32_t regno, reg_t reg);
   void loadarch_restore_reg(uint32_t regno, reg_t reg);
