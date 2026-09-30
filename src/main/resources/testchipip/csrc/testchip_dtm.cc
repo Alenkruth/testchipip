@@ -53,6 +53,7 @@ testchip_dtm_t::testchip_dtm_t(int argc, char** argv, bool can_have_loadmem)
   is_loadmem = false;
   loadarch_file = "";
   reconfig_csrs_file = "";
+  restore_cache_wipe = false;
   std::vector<std::string> args(argv + 1, argv + argc);
   for (auto& arg : args) {
     if (arg.find("+loadmem=") == 0)
@@ -61,6 +62,8 @@ testchip_dtm_t::testchip_dtm_t(int argc, char** argv, bool can_have_loadmem)
       loadarch_file = arg.substr(strlen("+loadarch="));
     if (arg.find("+reconfig_csrs=") == 0)
       reconfig_csrs_file = arg.substr(strlen("+reconfig_csrs="));
+    if (arg.find("+restore-cache-wipe") == 0)
+      restore_cache_wipe = true;   // [reconf-fix Phase C]
   }
   if (reconfig_csrs_file != "") {
     std::ifstream rcf(reconfig_csrs_file);
@@ -228,6 +231,155 @@ void testchip_dtm_t::loadarch_restore_csr(uint32_t regno, reg_t reg) {
   AC_RUN_OR_ABORT(cmd, prog, 5, data, 2);
 }
 
+// [reconf-fix Phase C] RESTORE-ONLY cache wipe (doc 30 Task 9).
+// Order is load-bearing: L1 discard walk FIRST (so no L1 release can be in
+// flight into a wiping L2), then the L2 directory wipe.  Both flows DISCARD —
+// every cached line is doomed pre-restore state; DRAM holds (or is about to
+// hold) the checkpoint image, and nothing cached may alias it.  Runs with the
+// hart halted, before any architectural state is restored (the program-buffer
+// helpers clobber S0, which is fine here and only here).
+// Signaling rule: no target tohost stores happen between the wipe and the
+// loadmem — all host<->target traffic in this window is DMI only.
+#define CSR_CF_CACHECTL       0xbc4
+#define CSR_CF_DCACHE_STATUS  0xbcd
+#define CF_L2_WIPE_ADDR       0x2010100
+
+// Every access below is a bare abstract command on the ALREADY-halted hart.
+// dtm_t's conveniences (read_csr/write_csr/read_chunk/write_chunk) all wrap
+// themselves in halt()..resume() — a resume here would set the wiped,
+// not-yet-restored hart running wild, so none of them may be used in this
+// window.  S0/S1 are clobbered freely: flush runs BEFORE any architectural
+// state is restored.
+#define CF_LUI(dst, imm20) (0x37 | ((dst) << 7) | ((uint32_t)(imm20) << 12))
+#define CF_LW(dst, base, imm) \
+  (0x00002003 | ((dst) << 7) | ((base) << 15) | (uint32_t)ENCODE_ITYPE_IMM(imm))
+#define CF_SW(src, base, imm) \
+  (0x00002023 | ((src) << 20) | ((base) << 15) | \
+   (RV_X(imm, 0, 5) << 7) | (RV_X(imm, 5, 7) << 25))
+#define CF_SD(src, base, imm) \
+  (0x00003023 | ((src) << 20) | ((base) << 15) | \
+   (RV_X(imm, 0, 5) << 7) | (RV_X(imm, 5, 7) << 25))
+
+// Read a CSR on the halted hart, returning its low 32 bits (enough for the
+// 18-bit 0xbcd status).  csrrs rd, csr, x0 reads without writing.
+uint32_t testchip_dtm_t::loadarch_read_csr32(uint32_t regno)
+{
+  // [fix 2026-08-12] s0 MUST be preserved.  These readbacks run AFTER the
+  // checkpoint's GPRs have been restored and immediately before resume(), so a bare
+  // `csrrs s0, regno, x0` resumes the target with s0 holding a CSR value instead of
+  // the program's data.  Measured: mcf sp_0 dies ~10 instructions after resume for
+  // ANY +reconfig_csrs (even a no-op 0xbc1=0 or an unrelated mscratch write), which
+  // masqueraded as a reconfiguration bug.  Same dscratch0 bracket that
+  // loadarch_restore_csr uses; still 5 program-buffer words.
+  uint32_t prog[5] = {
+    CSRRx(WRITE, S0, CSR_DSCRATCH0, S0),  // save s0 (swap into dscratch0)
+    CSRRx(SET, S0, regno, X0),            // csrrs s0, regno, x0
+    CF_SW(S0, X0, get_data_base()),       // low 32b -> DM data buffer
+    CSRRx(WRITE, S0, CSR_DSCRATCH0, S0),  // restore s0 (swap back)
+    EBREAK
+  };
+  uint32_t data[2] = {0, 0};
+  uint32_t cmd = (AC_ACCESS_REGISTER_POSTEXEC |
+                  AC_ACCESS_REGISTER_TRANSFER |
+                  AC_ACCESS_REGISTER_WRITE |
+                  AC_AR_SIZE(64) |
+                  AC_AR_REGNO(0));
+  AC_RUN_OR_ABORT(cmd, prog, 5, data, 2);
+  return read(DM_DATA0);
+}
+
+// [reconf-fix] 64-bit halted CSR read (abstract command, no resume). Mirrors
+// loadarch_read_csr32 but uses `sd` and reads both DM data words, so trap CSRs
+// (mepc/mtval/mcause with high-half addresses) are not truncated. Assumes the
+// hart is already halted; leaves it halted.
+reg_t testchip_dtm_t::loadarch_read_csr64(uint32_t regno)
+{
+  // [fix 2026-08-12] s0 preserved via dscratch0 — see loadarch_read_csr32.
+  uint32_t prog[5] = {
+    CSRRx(WRITE, S0, CSR_DSCRATCH0, S0),  // save s0
+    CSRRx(SET, S0, regno, X0),            // csrrs s0, regno, x0
+    CF_SD(S0, X0, get_data_base()),       // 64b -> DM data buffer
+    CSRRx(WRITE, S0, CSR_DSCRATCH0, S0),  // restore s0
+    EBREAK
+  };
+  uint32_t data[2] = {0, 0};
+  uint32_t cmd = (AC_ACCESS_REGISTER_POSTEXEC |
+                  AC_ACCESS_REGISTER_TRANSFER |
+                  AC_ACCESS_REGISTER_WRITE |
+                  AC_AR_SIZE(64) |
+                  AC_AR_REGNO(0));
+  AC_RUN_OR_ABORT(cmd, prog, 5, data, 2);
+  return ((reg_t)read(DM_DATA0)) | (((reg_t)read(DM_DATA0 + 1)) << 32);
+}
+
+void testchip_dtm_t::flush_caches_for_restore(int hartsel)
+{
+  printf("restore-wipe: hart %d L1 discard walk (csrw 0xbc4, 0x2)\n", hartsel);
+  loadarch_restore_csr(CSR_CF_CACHECTL, 0x2);
+  // One DMI round-trip >> the <=~256-target-cycle walk, so the first read
+  // normally already shows idle; the loop is a safety net, not a spin.
+  size_t polls = 0;
+  while (loadarch_read_csr32(CSR_CF_DCACHE_STATUS) & (1u << 17)) {
+    if (++polls > 1000) { printf("restore-wipe: L1 walk stuck busy\n"); abort(); }
+  }
+  printf("restore-wipe: L2 directory wipe (0x%x <- 1)\n", CF_L2_WIPE_ADDR);
+  {
+    uint32_t prog[4] = {
+      CF_LUI(S0, 0x2010),               // s0 = 0x02010000
+      ADDI(S1, X0, 1),
+      CF_SW(S1, S0, 0x100),             // sw 1, 0x100(s0): trigger wipe
+      EBREAK
+    };
+    uint32_t data[2] = {0, 0};
+    uint32_t cmd = (AC_ACCESS_REGISTER_POSTEXEC |
+                    AC_ACCESS_REGISTER_TRANSFER |
+                    AC_ACCESS_REGISTER_WRITE |
+                    AC_AR_SIZE(64) |
+                    AC_AR_REGNO(0));
+    AC_RUN_OR_ABORT(cmd, prog, 4, data, 2);
+  }
+  polls = 0;
+  uint32_t busy = 1;
+  do {
+    uint32_t prog[4] = {
+      CF_LUI(S0, 0x2010),
+      CF_LW(S1, S0, 0x100),             // lw s1, 0x100(s0): busy bit
+      CF_SW(S1, X0, get_data_base()),
+      EBREAK
+    };
+    uint32_t data[2] = {0, 0};
+    uint32_t cmd = (AC_ACCESS_REGISTER_POSTEXEC |
+                    AC_ACCESS_REGISTER_TRANSFER |
+                    AC_ACCESS_REGISTER_WRITE |
+                    AC_AR_SIZE(64) |
+                    AC_AR_REGNO(0));
+    AC_RUN_OR_ABORT(cmd, prog, 4, data, 2);
+    busy = read(DM_DATA0);
+    if (++polls > 100000) { printf("restore-wipe: L2 wipe stuck busy\n"); abort(); }
+  } while (busy & 1);
+  printf("restore-wipe: caches wiped (%zu L2 polls)\n", polls);
+}
+
+// fence.i on the halted hart via the program buffer: after a mid-run restore
+// the I$ may hold stale lines aliasing the fresh DRAM image; the L2 was wiped,
+// so post-fence refills are image-fresh.  Runs after all state restore, right
+// before resume (touches no architectural register, and DPC is unaffected by
+// program-buffer execution).
+void testchip_dtm_t::loadarch_fencei()
+{
+  uint32_t prog[2] = { 0x0000100f /* fence.i */, EBREAK };
+  // Same encoding as dtm_t::fence_i (transfer-to-X0 is the proven path; its
+  // own TODO warns transfer=0 is untested) — but unlike dtm_t::fence_i this
+  // runs on an already-halted hart and does NOT resume it.
+  uint32_t cmd = (AC_ACCESS_REGISTER_POSTEXEC |
+                  AC_ACCESS_REGISTER_TRANSFER |
+                  AC_ACCESS_REGISTER_WRITE |
+                  AC_AR_SIZE(64) |
+                  AC_AR_REGNO(0));
+  printf("restore-wipe: fence.i before resume\n");
+  AC_RUN_OR_ABORT(cmd, prog, 2, 0, 0);
+}
+
 void testchip_dtm_t::reset()
 {
   testchip_htif_t::perform_init_accesses();
@@ -337,6 +489,9 @@ void testchip_dtm_t::reset()
 
       halt(hartsel);
 
+      // [reconf-fix Phase C] wipe L1+L2 while halted, BEFORE restoring state.
+      if (restore_cache_wipe) flush_caches_for_restore(hartsel);
+
       loadarch_restore_csr(CSR_MSTATUS , MSTATUS_FS | MSTATUS_XS | MSTATUS_VS);
       if (state.mstatus & MSTATUS_FS) {
         for (size_t i = 0; i < 32; i++) {
@@ -387,7 +542,29 @@ void testchip_dtm_t::reset()
     for (size_t hartsel = 0; hartsel < nharts; hartsel++) {
       for (auto& csr : reconfig_csrs) {
         loadarch_restore_csr(csr.first, (reg_t)csr.second);
+        // [diag 2026-08-11] The documented contract is `csrw 0xbc4,0x2; fence` --
+        // the fence blocks on io.lsu.ordered while dcache_wipe_busy. The DTM emits
+        // bare abstract-command writes with NO fence, so poll 0xbcd[17] here to
+        // supply that ordering explicitly, and report whether the walk ever ran.
+        if (csr.first == CSR_CF_CACHECTL && (((reg_t)csr.second) & 0x2)) {
+          uint32_t st0 = loadarch_read_csr32(CSR_CF_DCACHE_STATUS);
+          size_t polls = 0;
+          while (loadarch_read_csr32(CSR_CF_DCACHE_STATUS) & (1u << 17)) {
+            if (++polls > 100000) { printf("reconfig: L1 walk STUCK busy\n"); break; }
+          }
+          printf("reconfig: csrw 0xbc4=0x%lx -> 0xbcd=0x%08x busy_at_write=%d settled_polls=%zu\n",
+                 (unsigned long)csr.second, st0, (st0 >> 17) & 1, polls);
+          fflush(stdout);
+        }
       }
+        // [removed 2026-08-12] Diagnostic 0xbcd/0xbc1/mcycle readbacks deleted.  They ran
+        // after the GPRs were restored and, via the then-unbracketed loadarch_read_csr32,
+        // clobbered s0 -- corrupting the resumed program for ANY +reconfig_csrs run
+        // (even a no-op 0xbc1=0).  loadarch_read_csr32 now preserves s0 via dscratch0;
+        // these readbacks are removed regardless: instrumentation, not function.
+      // [reconf-fix Phase C] I$ may alias the fresh image after a mid-run
+      // restore; fence.i as the last act before resume.
+      if (restore_cache_wipe) loadarch_fencei();
       resume(hartsel);
     }
   } else {

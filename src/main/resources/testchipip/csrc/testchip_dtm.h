@@ -86,12 +86,24 @@ class testchip_dtm_t : private testchip_dtm_arg_filter_t, public dtm_t, public t
   virtual void load_mem_write(addr_t taddr, size_t nbytes, const void* src) { };
   virtual void load_mem_read(addr_t taddr, size_t nbytes, void* dst) { };
   bool has_loadmem;
+  // [reconf-fix] 64-bit halted CSR read (see .cc); protected so subclasses
+  // (firesim_dtm_t trap-CSR dump) can use it.
+  reg_t loadarch_read_csr64(uint32_t regno);
 
  private:
   bool is_loadmem;
   std::string loadarch_file;
   std::string reconfig_csrs_file;
   std::vector<std::pair<uint32_t, uint64_t>> reconfig_csrs;
+  // [reconf-fix Phase C] +restore-cache-wipe: before restoring architectural
+  // state, discard-invalidate L1 D$ (CSR 0xbc4 walk) and wipe the L2
+  // directory (L2ctrl+0x100), then fence.i before resume.  Requires the
+  // reconf-enabled core (0xbc4/0xbcd exist only there) and an L2 built with
+  // the wipe register.  RESTORE-ONLY: drops all dirty cached state.
+  bool restore_cache_wipe;
+  void flush_caches_for_restore(int hartsel);
+  void loadarch_fencei();
+  uint32_t loadarch_read_csr32(uint32_t regno);
 
   void loadarch_restore_csr(uint32_t regno, reg_t reg);
   void loadarch_restore_reg(uint32_t regno, reg_t reg);
