@@ -515,6 +515,23 @@ void testchip_dtm_t::reset()
       loadarch_restore_csr(CSR_SEPC     , state.sepc);
       loadarch_restore_csr(CSR_STVAL    , state.stval);
       loadarch_restore_csr(CSR_SATP     , state.satp);
+      // [restore-fix 2026-08-09] Counter-enable CSRs. rocket's reg_mcounteren /
+      // reg_scounteren are plain Reg() with NO RegInit (CSR.scala:530-537), so nothing
+      // initialises them -- on the FPGA they come up zero. CSR.scala:912 gates every
+      // counter read on them:
+      //     allow_counter = (prv > S || read_mcounteren(addr)) &&
+      //                     (!usingSupervisor || prv >= S || read_scounteren(addr))
+      // so with them zero EVERY S/U-mode rdcycle/rdtime/rdinstret is an illegal
+      // instruction and traps to M-mode. The checkpoint's OS and benchmark both read
+      // the timers, so the restored image spends its life in the trap handler:
+      // measured 648.exchange2_s/sp_0 at IPC 0.548 with D$ 49.5 MPKI, versus
+      // 1.448 / 0.007 MPKI once these are set -- a 2.6x whole-suite slowdown that
+      // looks exactly like a cache regression (the handler thrashes both L1s).
+      // These are NOT in the 95-line loadarch file; spike checkpoints assume counters
+      // are readable, so enable all of them unconditionally. This restores behaviour
+      // the pre-2026-08-08 driver had and that was lost in the Phase C rewrite.
+      loadarch_restore_csr(CSR_SCOUNTEREN, ~(reg_t)0);
+      loadarch_restore_csr(CSR_MCOUNTEREN, ~(reg_t)0);
       loadarch_restore_csr(CSR_MSTATUS  , state.mstatus);
       loadarch_restore_csr(CSR_MEDELEG  , state.medeleg);
       loadarch_restore_csr(CSR_MIDELEG  , state.mideleg);
