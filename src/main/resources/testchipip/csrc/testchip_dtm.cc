@@ -83,9 +83,32 @@ testchip_dtm_t::testchip_dtm_t(int argc, char** argv, bool can_have_loadmem)
 }
 
 
+// [2026-08-10] DO NOT "simplify" this predicate back to bare `is_loadmem`.
+//
+// WHY: dtm_t::{read,write}_chunk is the DMI path -- it HALTS the hart, drives the access
+// via abstract commands / the program buffer, and resumes. After loadarch, FESVR polls
+// tohost/fromhost through read_chunk for the whole run. MEASURED with branch counters:
+// >100,000 read_chunk calls per run. Sending those down DMI stalls the core continuously
+// and evicts the working set from both L1s.
+//
+// MEASURED on 648.exchange2_s/sp_0 (same bitstream/checkpoint/plusargs, 100M-instr window):
+//     `is_loadmem || (loadarch_done && has_loadmem)` -> IPC 1.4497, D$  0.0073 MPKI (6 runs)
+//     bare `is_loadmem`                              -> IPC 0.5488, D$ 49.49   MPKI (3 runs)
+// 2.6x, reproducible in both directions. is_loadmem alone is insufficient: it is set only
+// inside load_program() and cleared immediately after, so it is false for the entire run.
+// loadarch_done is what makes the post-restore traffic take the fast path.
+//
+// TRAP FOR FUTURE DEBUGGING: firesim_dtm_t::load_mem_read/load_mem_write fprintf(stdout)
+// on EVERY call, yet those lines appear ZERO times in the uartlog even though temporary
+// branch counters measured >100k calls. That stdout is swallowed somewhere. Do NOT infer
+// "never called" from their absence -- an earlier investigation did exactly that and
+// wrongly retracted this explanation. If you need call counts, add temporary counters
+// printing to STDERR (they were removed here to keep the hot path clean).
+//
+// Full history: claude-artifacts/37-session-changelog-2026-08-09.md
 void testchip_dtm_t::write_chunk(addr_t taddr, size_t nbytes, const void* src)
 {
-  if (is_loadmem) {
+  if (is_loadmem || (loadarch_done && has_loadmem)) {
     load_mem_write(taddr, nbytes, src);
   } else {
     dtm_t::write_chunk(taddr, nbytes, src);
@@ -94,7 +117,7 @@ void testchip_dtm_t::write_chunk(addr_t taddr, size_t nbytes, const void* src)
 
 void testchip_dtm_t::read_chunk(addr_t taddr, size_t nbytes, void* dst)
 {
-  if (is_loadmem) {
+  if (is_loadmem || (loadarch_done && has_loadmem)) {
     load_mem_read(taddr, nbytes, dst);
   } else {
     dtm_t::read_chunk(taddr, nbytes, dst);
