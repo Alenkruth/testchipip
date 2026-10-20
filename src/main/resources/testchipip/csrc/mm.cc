@@ -72,9 +72,13 @@ void mm_magic_t::tick(
 
   if (ar_fire) {
     uint64_t start_addr = (ar_addr / word_size) * word_size;
+    // [MMJIT] the whole burst waits `cycle + jitter`; its later beats follow back to back.
+    // r_valid() needs cycle > ready, and cycle is incremented below, so jitter 0 presents
+    // the first beat on the very next evaluation, as before.
+    uint64_t ready = cycle + draw_jitter();
     for (int i = 0; i <= ar_len; i++) {
       auto dat = read(start_addr + i * word_size);
-      rresp.push(mm_rresp_t(ar_id, dat, i == ar_len));
+      rresp.push(mm_rresp_t(ar_id, dat, i == ar_len, ready));
     }
   }
 
@@ -94,12 +98,15 @@ void mm_magic_t::tick(
     if (store_count == 0) {
       store_inflight = false;
       bresp.push(store_id);
+      bresp_ready.push(cycle + draw_jitter());   // [MMJIT]
       assert(w_last);
     }
   }
 
-  if (b_fire)
+  if (b_fire) {
     bresp.pop();
+    bresp_ready.pop();   // [MMJIT]
+  }
 
   if (r_fire)
     rresp.pop();
@@ -108,6 +115,7 @@ void mm_magic_t::tick(
 
   if (reset) {
     while (!bresp.empty()) bresp.pop();
+    while (!bresp_ready.empty()) bresp_ready.pop();   // [MMJIT]
     while (!rresp.empty()) rresp.pop();
     cycle = 0;
   }

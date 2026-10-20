@@ -1,6 +1,9 @@
 #include <vpi_user.h>
 #include <svdpi.h>
 #include <stdint.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <cassert>
 #include <sys/mman.h>
 #include <fesvr/memif.h>
@@ -38,6 +41,11 @@ extern "C" void *memory_init(
     std::string system_ini = "system.ini";
     std::string ini_dir = "dramsim2_ini";
 
+    // [MMJIT] +mm_jitter=J (max extra ticks per read burst / write ack, default 0 = stock
+    // timing) and +mm_jitter_seed=S (default: the +verilator+seed+N value, so one seed
+    // plusarg drives both register init and the DRAM jitter).
+    uint64_t mm_jitter = 0, mm_jitter_seed = 0;
+
     if (!vpi_get_vlog_info(&info))
       abort();
 
@@ -50,6 +58,12 @@ extern "C" void *memory_init(
         ini_dir = arg.substr(strlen("+dramsim_ini_dir="));
       if (arg.find("+loadmem=") == 0)
         loadmem_file = arg.substr(strlen("+loadmem="));
+      if (arg.find("+mm_jitter=") == 0)
+        mm_jitter = strtoull(arg.c_str() + strlen("+mm_jitter="), NULL, 0);
+      if (arg.find("+mm_jitter_seed=") == 0)
+        mm_jitter_seed = strtoull(arg.c_str() + strlen("+mm_jitter_seed="), NULL, 0);
+      else if (arg.find("+verilator+seed+") == 0 && mm_jitter_seed == 0)
+        mm_jitter_seed = strtoull(arg.c_str() + strlen("+verilator+seed+"), NULL, 0);
     }
 
     while (chip_id >= backing_mem_data.size()) {
@@ -92,9 +106,17 @@ extern "C" void *memory_init(
                                        backing_mem_data[chip_id][mem_base],
                                        memory_ini, system_ini, ini_dir,
                                        1 << id_bits, clock_hz));
-    else
-      mm = (mm_t *) (new mm_magic_t(mem_base, mem_size, word_size, line_size,
-                                    backing_mem_data[chip_id][mem_base]));
+    else {
+      mm_magic_t *mg = new mm_magic_t(mem_base, mem_size, word_size, line_size,
+                                      backing_mem_data[chip_id][mem_base]);
+      // [MMJIT] distinct stream per channel and chip; +dramsim runs ignore the knob
+      mg->set_jitter(mm_jitter, (mm_jitter_seed + 1) * 0x9E3779B97F4A7C15ULL ^ (uint64_t)mem_base ^ ((uint64_t)chip_id << 56));
+      if (mm_jitter)
+        fprintf(stderr, "[MMJIT] chip %d base 0x%llx: DRAM response jitter 0..%llu ticks, seed %llu\n",
+                chip_id, (unsigned long long)mem_base, (unsigned long long)mm_jitter,
+                (unsigned long long)mm_jitter_seed);
+      mm = (mm_t *) mg;
+    }
 
 
     return mm;
